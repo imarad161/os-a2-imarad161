@@ -82,9 +82,34 @@ usertrap(void)
     kexit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2)
-    yield();
+  if (which_dev == 2) {
+int should_yield = 0;
 
+
+acquire(&p->lock);
+p->runticks++;
+p->ticks_used++;
+
+if (p->ticks_used >= (1 << p->level)) {
+  if (p->level < 3)
+    p->level++;
+
+  p->ticks_used = 0;
+  should_yield = 1;
+}
+
+int current_level = p->level;
+
+release(&p->lock);
+
+// Yield if a higher-priority process is ready.
+if (!should_yield && higher_priority_runnable(current_level))
+  should_yield = 1;
+
+if (should_yield)
+  yield();
+
+}
   prepare_return();
 
   // the user page table to switch to, for trampoline.S
@@ -154,8 +179,33 @@ kerneltrap()
   }
 
   // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2 && myproc() != 0)
+  if (which_dev == 2 && myproc() != 0) {
+struct proc *p = myproc();
+int should_yield = 0;
+
+  acquire(&p->lock);
+  p->runticks++;
+  p->ticks_used++;
+  
+if (p->ticks_used >= (1 << p->level)) {
+    if (p->level < 3)
+      p->level++;
+
+    p->ticks_used = 0;
+    should_yield = 1;
+  }
+
+  int current_level = p->level;
+
+  release(&p->lock);
+
+  // Yield if a higher-priority process is ready.
+  if (!should_yield && higher_priority_runnable(current_level))
+    should_yield = 1;
+
+  if (should_yield)
     yield();
+}
 
   // the yield() may have caused some traps to occur,
   // so restore trap registers for use by kernelvec.S's sepc instruction.
@@ -167,10 +217,16 @@ void
 clockintr()
 {
   if (cpuid() == 0) {
+    int boost;
+
     acquire(&tickslock);
     ticks++;
+    boost = (ticks % 64 == 0);
     wakeup(&ticks);
     release(&tickslock);
+
+    if (boost)
+	priorityboost();
   }
 
   // ask for the next timer interrupt. this also clears

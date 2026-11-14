@@ -79,6 +79,9 @@ void            panic(char*) __attribute__((noreturn));
 void            printkinit(void);
 
 // proc.c
+int 		getpinfo(uint64, int);
+void 		priorityboost(void);
+int 		higher_priority_runnable(int);
 int             cpuid(void);
 void            kexit(int);
 int             kfork(void);

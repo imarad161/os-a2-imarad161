@@ -110,3 +110,18 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+// Return process information to a user program.
+uint64
+sys_getpinfo(void)
+{
+  uint64 buf;
+  int max;
+
+  argaddr(0, &buf);
+  argint(1, &max);
+
+  if (max < 0)
+    return -1;
+
+  return getpinfo(buf, max);
+}

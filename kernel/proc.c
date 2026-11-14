@@ -4,11 +4,31 @@
 #include "riscv.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "pinfo.h"
 #include "defs.h"
 
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
+
+int mlfq_cursor[4] = {0,0,0,0};
+struct spinlock mlfq_lock;
+
+void priorityboost(void)
+{
+  struct proc *p;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+
+    if (p->state != UNUSED) {
+      p->level = 0;
+      p->ticks_used = 0;
+    }
+
+    release(&p->lock);
+  }
+}
 
 struct proc *initproc;
 
@@ -51,6 +71,7 @@ procinit(void)
 
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+  initlock(&mlfq_lock, "mlfq");
   for (p = proc; p < &proc[NPROC]; p++) {
     initlock(&p->lock, "proc");
     p->state = UNUSED;
@@ -124,6 +145,11 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->runticks = 0;
+  p->nsched = 0;
+  p->ctime = ticks;
+  p->level = 0;
+  p->ticks_used = 0;
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -418,6 +444,26 @@ kwait(uint64 addr)
   }
 }
 
+// Check if a higher-priority process is ready to run.
+int
+higher_priority_runnable(int current_level)
+{
+  struct proc *p;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+
+    if (p->state == RUNNABLE && p->level < current_level) {
+      release(&p->lock);
+      return 1;
+    }
+
+    release(&p->lock);
+  }
+
+  return 0;
+}
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
@@ -425,54 +471,65 @@ kwait(uint64 addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
+
 void
 scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
+  int level, i, start, idx;
+  int found;
 
   c->proc = 0;
+
   for (;;) {
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
     intr_on();
     intr_off();
 
-    int found = 0;
-    for (p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
+    found = 0;
 
-        // Don't re-enable interrupts on release.
-        mycpu()->intena = 0;
+    for (level = 0; level < 4 && !found; level++) {
+      acquire(&mlfq_lock);
+      start = mlfq_cursor[level];
+      release(&mlfq_lock);
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+      for (i = 0; i < NPROC; i++) {
+        idx = (start + i) % NPROC;
+        p = &proc[idx];
+
+        acquire(&p->lock);
+
+        if (p->state == RUNNABLE && p->level == level) {
+          acquire(&mlfq_lock);
+          mlfq_cursor[level] = (idx + 1) % NPROC;
+          release(&mlfq_lock);
+
+          p->state = RUNNING;
+          c->proc = p;
+          p->nsched++;
+
+          swtch(&c->context, &p->context);
+
+          // Don't re-enable interrupts on release.
+          mycpu()->intena = 0;
+
+          c->proc = 0;
+          found = 1;
+
+          release(&p->lock);
+          break;
+        }
+
+        release(&p->lock);
       }
-      release(&p->lock);
     }
+
     if (found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
     }
   }
 }
 
-// Switch to scheduler.  Must hold only p->lock
-// and have changed proc->state. Saves and restores
-// intena because intena is a property of this
-// kernel thread, not this CPU. It should
 // be proc->intena and proc->noff, but that would
 // break in the few places where a lock is held but
 // there's no process.
@@ -700,4 +757,43 @@ procdump(void)
     printk("%d %s %s", p->pid, state, p->name);
     printk("\n");
   }
+}
+
+int
+getpinfo(uint64 buf, int max)
+{
+  struct proc *p;
+  struct pinfo info;
+  int count = 0;
+
+  if (max < 0)
+    return -1;
+
+  for (p = proc; p < &proc[NPROC] && count < max; p++) {
+    acquire(&p->lock);
+
+    if (p->state == UNUSED) {
+      release(&p->lock);
+      continue;
+    }
+
+    info.pid = p->pid;
+    info.state = p->state;
+    info.level = p->level;
+    info.runticks = p->runticks;
+    info.nsched = p->nsched;
+    info.ctime = p->ctime;
+    safestrcpy(info.name, p->name, sizeof(info.name));
+
+    release(&p->lock);
+
+    if (copyout(myproc()->pagetable, myproc()->sz,
+            buf + count * sizeof(info),
+            (char *)&info, sizeof(info)) < 0)
+  return -1;
+
+    count++;
+  }
+
+  return count;
 }
